@@ -1,0 +1,527 @@
+// E-World database schema.
+// Conventions: cuid ids, snake_case table names via @@map, UTC timestamps.
+// Enums mirror packages/shared/src/enums. Gameplay-mutable hot state (position,
+// stats) lives on Player and is written-behind from the in-memory sim.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── Identity ───────────────────────────────
+
+enum UserRole {
+  PLAYER
+  MODERATOR
+  ADMIN
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  googleId     String    @unique @map("google_id")
+  username     String    @unique
+  avatarUrl    String?   @map("avatar_url")
+  role         UserRole  @default(PLAYER)
+  isBanned     Boolean   @default(false) @map("is_banned")
+  banReason    String?   @map("ban_reason")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  lastLoginAt  DateTime? @map("last_login_at")
+
+  player        Player?
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+/// Rotating refresh tokens with reuse detection. We store only a hash.
+model RefreshToken {
+  id          String    @id @default(cuid())
+  userId      String    @map("user_id")
+  tokenHash   String    @unique @map("token_hash")
+  family      String // rotation family; reuse of a revoked token in a family revokes the family
+  expiresAt   DateTime  @map("expires_at")
+  revokedAt   DateTime? @map("revoked_at")
+  replacedBy  String?   @map("replaced_by")
+  userAgent   String?   @map("user_agent")
+  ip          String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([family])
+  @@map("refresh_tokens")
+}
+
+// ─────────────────────────────── Player ─────────────────────────────────
+
+model Player {
+  id        String @id @default(cuid())
+  userId    String @unique @map("user_id")
+
+  level     Int    @default(1)
+  xp        Int    @default(0)
+  coins     Int    @default(0)
+
+  health    Int    @default(100)
+  maxHealth Int    @default(100) @map("max_health")
+  stamina   Int    @default(100)
+  maxStamina Int   @default(100) @map("max_stamina")
+  mana      Int    @default(50)
+  maxMana   Int    @default(50) @map("max_mana")
+
+  // Hot state: current transform + world. Written-behind from the sim.
+  worldId   String @default("overworld") @map("world_id")
+  posX      Float  @default(0) @map("pos_x")
+  posY      Float  @default(60) @map("pos_y")
+  posZ      Float  @default(0) @map("pos_z")
+  yaw       Float  @default(0)
+  pitch     Float  @default(0)
+
+  settings  Json   @default("{}")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  inventory        InventoryItem[]
+  equipment        Equipment[]
+  learnedSkills    PlayerSkill[]
+  elements         PlayerElement[]
+  questStates      PlayerQuest[]
+  achievements     PlayerAchievement[]
+  npcRelations     NpcRelationship[]
+
+  @@map("players")
+}
+
+// ──────────────────────────── Items & Inventory ─────────────────────────
+
+enum ItemCategory {
+  WEAPON
+  ARMOR
+  TOOL
+  FOOD
+  MEDICINE
+  POTION
+  ACCESSORY
+  MAGIC_SCROLL
+  FURNITURE
+  MATERIAL
+  BUILDING_MATERIAL
+  RESOURCE
+  QUEST
+}
+
+enum Rarity {
+  COMMON
+  UNCOMMON
+  RARE
+  EPIC
+  LEGENDARY
+  MYTHIC
+}
+
+/// Item template (definition). Instances reference this by `key`.
+model ItemDefinition {
+  key         String       @id // e.g. "iron_pickaxe"
+  name        String
+  description String       @default("")
+  category    ItemCategory
+  rarity      Rarity       @default(COMMON)
+  weight      Float        @default(1)
+  maxStack    Int          @default(99) @map("max_stack")
+  basePrice   Int          @default(0) @map("base_price")
+  iconUrl     String?      @map("icon_url")
+  modelUrl    String?      @map("model_url")
+  stats       Json         @default("{}") // damage, defense, etc.
+
+  inventoryItems InventoryItem[]
+  craftedBy      CraftingRecipe[] @relation("recipe_output")
+  recipeInputs   RecipeIngredient[]
+
+  @@map("item_definitions")
+}
+
+model InventoryItem {
+  id        String @id @default(cuid())
+  playerId  String @map("player_id")
+  itemKey   String @map("item_key")
+  quantity  Int    @default(1)
+  slot      Int // grid slot index
+  metadata  Json   @default("{}") // durability, enchantments
+
+  player Player         @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  item   ItemDefinition @relation(fields: [itemKey], references: [key])
+
+  @@unique([playerId, slot])
+  @@index([playerId])
+  @@map("inventory_items")
+}
+
+enum EquipmentSlot {
+  HEAD
+  CHEST
+  LEGS
+  FEET
+  HANDS
+  MAIN_HAND
+  OFF_HAND
+  RING_1
+  RING_2
+  AMULET
+  CAPE
+}
+
+model Equipment {
+  id       String        @id @default(cuid())
+  playerId String        @map("player_id")
+  slot     EquipmentSlot
+  itemKey  String        @map("item_key")
+  metadata Json          @default("{}")
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([playerId, slot])
+  @@map("equipment")
+}
+
+// ─────────────────────────── Skills & Elements ──────────────────────────
+
+enum SkillTree {
+  MOVEMENT
+  COMBAT
+  GATHERING
+  ELEMENT
+}
+
+enum Element {
+  FIRE
+  WATER
+  EARTH
+  LIGHTNING
+  WIND
+  NATURE
+  LIGHT
+  DARK
+}
+
+model SkillDefinition {
+  key         String    @id // e.g. "double_jump"
+  name        String
+  description String    @default("")
+  tree        SkillTree
+  element     Element? // set when tree = ELEMENT
+  tier        Int       @default(1)
+  costCoins   Int       @default(0) @map("cost_coins")
+  /// keys of prerequisite skills
+  requires    String[]  @default([])
+  teacherNpc  String?   @map("teacher_npc") // NpcDefinition.key
+
+  learnedBy PlayerSkill[]
+
+  @@map("skill_definitions")
+}
+
+model PlayerSkill {
+  id        String   @id @default(cuid())
+  playerId  String   @map("player_id")
+  skillKey  String   @map("skill_key")
+  rank      Int      @default(1)
+  learnedAt DateTime @default(now()) @map("learned_at")
+
+  player Player          @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  skill  SkillDefinition @relation(fields: [skillKey], references: [key])
+
+  @@unique([playerId, skillKey])
+  @@map("player_skills")
+}
+
+model PlayerElement {
+  id        String   @id @default(cuid())
+  playerId  String   @map("player_id")
+  element   Element
+  mastery   Int      @default(0) // 0..100
+  unlockedAt DateTime @default(now()) @map("unlocked_at")
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([playerId, element])
+  @@map("player_elements")
+}
+
+// ──────────────────────────── Crafting ──────────────────────────────────
+
+model CraftingRecipe {
+  key         String  @id
+  outputKey   String  @map("output_key")
+  outputQty   Int     @default(1) @map("output_qty")
+  station     String? // e.g. "forge", "alchemy_table"
+  unlockLevel Int     @default(1) @map("unlock_level")
+
+  output      ItemDefinition     @relation("recipe_output", fields: [outputKey], references: [key])
+  ingredients RecipeIngredient[]
+
+  @@map("crafting_recipes")
+}
+
+model RecipeIngredient {
+  id        String @id @default(cuid())
+  recipeKey String @map("recipe_key")
+  itemKey   String @map("item_key")
+  quantity  Int    @default(1)
+
+  recipe CraftingRecipe @relation(fields: [recipeKey], references: [key], onDelete: Cascade)
+  item   ItemDefinition @relation(fields: [itemKey], references: [key])
+
+  @@unique([recipeKey, itemKey])
+  @@map("recipe_ingredients")
+}
+
+// ──────────────────────────── World content ─────────────────────────────
+
+enum Biome {
+  FOREST
+  MOUNTAIN
+  SNOW
+  DESERT
+  BEACH
+  OCEAN
+  VOLCANO
+  SWAMP
+  RUINS
+  VILLAGE
+  CAPITAL_CITY
+  MAGIC_ACADEMY
+  ANCIENT_TEMPLE
+  SKY_ISLAND
+  DUNGEON
+  MINE
+  UNDERGROUND_CAVE
+  BOSS_AREA
+}
+
+/// Handcrafted points of interest overlaid on the procedural world.
+model PointOfInterest {
+  id        String @id @default(cuid())
+  key       String @unique
+  name      String
+  biome     Biome
+  posX      Float  @map("pos_x")
+  posY      Float  @map("pos_y")
+  posZ      Float  @map("pos_z")
+  radius    Float  @default(50)
+  data      Json   @default("{}")
+
+  npcs Npc[]
+
+  @@map("points_of_interest")
+}
+
+// ─────────────────────────────── NPCs ───────────────────────────────────
+
+model NpcDefinition {
+  key         String  @id
+  name        String
+  role        String  @default("villager") // merchant, master, questgiver...
+  dialogue    Json    @default("{}") // dialogue tree
+  shopId      String? @map("shop_id")
+  modelUrl    String? @map("model_url")
+
+  npcs          Npc[]
+  relationships NpcRelationship[]
+
+  @@map("npc_definitions")
+}
+
+/// A placed, schedulable NPC instance in the world.
+model Npc {
+  id          String  @id @default(cuid())
+  defKey      String  @map("def_key")
+  poiId       String? @map("poi_id")
+  homeX       Float   @map("home_x")
+  homeY       Float   @map("home_y")
+  homeZ       Float   @map("home_z")
+  schedule    Json    @default("[]") // [{ phase, activity, x, y, z }]
+
+  definition NpcDefinition    @relation(fields: [defKey], references: [key])
+  poi        PointOfInterest? @relation(fields: [poiId], references: [id])
+
+  @@index([defKey])
+  @@map("npcs")
+}
+
+/// Reputation / friendship + NPC memory of a player's actions.
+model NpcRelationship {
+  id         String @id @default(cuid())
+  playerId   String @map("player_id")
+  npcDefKey  String @map("npc_def_key")
+  friendship Int    @default(0)
+  reputation Int    @default(0)
+  memory     Json   @default("[]") // remembered events
+
+  player Player        @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  npcDef NpcDefinition @relation(fields: [npcDefKey], references: [key])
+
+  @@unique([playerId, npcDefKey])
+  @@map("npc_relationships")
+}
+
+// ─────────────────────────────── Quests ─────────────────────────────────
+
+enum QuestType {
+  MAIN
+  SIDE
+  GUILD
+  DAILY
+  WEEKLY
+  HIDDEN
+  WORLD
+}
+
+enum QuestStatus {
+  AVAILABLE
+  ACTIVE
+  COMPLETED
+  TURNED_IN
+  FAILED
+}
+
+model QuestDefinition {
+  key         String    @id
+  title       String
+  description String    @default("")
+  type        QuestType
+  objectives  Json      @default("[]") // [{ id, kind, target, count }]
+  rewards     Json      @default("{}") // { coins, xp, items[], skills[], unlockArea }
+  prerequisites String[] @default([]) @map("prerequisites")
+
+  states PlayerQuest[]
+
+  @@map("quest_definitions")
+}
+
+model PlayerQuest {
+  id        String      @id @default(cuid())
+  playerId  String      @map("player_id")
+  questKey  String      @map("quest_key")
+  status    QuestStatus @default(ACTIVE)
+  progress  Json        @default("{}") // { objectiveId: count }
+  updatedAt DateTime    @updatedAt @map("updated_at")
+
+  player Player          @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  quest  QuestDefinition @relation(fields: [questKey], references: [key])
+
+  @@unique([playerId, questKey])
+  @@index([playerId])
+  @@map("player_quests")
+}
+
+// ──────────────────────────── Achievements ──────────────────────────────
+
+model AchievementDefinition {
+  key         String @id
+  name        String
+  description String @default("")
+  target      Int    @default(1)
+  rewardCoins Int    @default(0) @map("reward_coins")
+
+  progress PlayerAchievement[]
+
+  @@map("achievement_definitions")
+}
+
+model PlayerAchievement {
+  id             String    @id @default(cuid())
+  playerId       String    @map("player_id")
+  achievementKey String    @map("achievement_key")
+  progress       Int       @default(0)
+  unlockedAt     DateTime? @map("unlocked_at")
+
+  player      Player                @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  achievement AchievementDefinition @relation(fields: [achievementKey], references: [key])
+
+  @@unique([playerId, achievementKey])
+  @@map("player_achievements")
+}
+
+// ──────────────────────────── Resource catalog ──────────────────────────
+
+enum ResourceKind {
+  WOOD
+  STONE
+  COAL
+  IRON
+  COPPER
+  GOLD
+  SILVER
+  DIAMOND
+  RUBY
+  EMERALD
+  SAPPHIRE
+  QUARTZ
+  CRYSTAL
+  OBSIDIAN
+  MITHRIL
+  ANCIENT_ORE
+  CLAY
+  SAND
+  SALT
+  ICE_CRYSTAL
+  CORAL
+  PEARL
+  SEAWEED
+  HERBS
+  FLOWERS
+  MUSHROOMS
+  ANIMAL_HIDE
+  BONES
+  LEATHER
+  FISH
+  WATER
+  LAVA_CRYSTAL
+}
+
+/// Tuning for each gatherable resource (respawn, rarity, drop item).
+model ResourceDefinition {
+  kind          ResourceKind @id
+  rarity        Rarity       @default(COMMON)
+  weight        Float        @default(1)
+  basePrice     Int          @default(1) @map("base_price")
+  respawnSec    Int          @default(300) @map("respawn_sec")
+  yieldItemKey  String       @map("yield_item_key")
+  requiredTool  String?      @map("required_tool") // tool tier needed
+
+  @@map("resource_definitions")
+}
+
+// ─────────────────────── Live-ops / moderation ──────────────────────────
+
+model Announcement {
+  id        String   @id @default(cuid())
+  title     String
+  body      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime? @map("expires_at")
+
+  @@map("announcements")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?  @map("actor_id") // admin/mod user id
+  action    String
+  targetId  String?  @map("target_id")
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([actorId])
+  @@map("audit_logs")
+}
